@@ -10,6 +10,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+  import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
   const firebaseConfig = {
     apiKey: "AIzaSyAtbDFNjEdD2pB72LJHpjBRhaI36Jm8mJ4",
     authDomain: "guarantee-tracker.firebaseapp.com",
@@ -21,8 +22,23 @@
   };
   const app = initializeApp(firebaseConfig);
   const db = getDatabase(app);
-  window._fbSave = (data) => set(ref(db, 'banks'), data);
-  window._fbListen = (cb) => onValue(ref(db, 'banks'), (snap) => cb(snap.val()));
+  const auth = getAuth(app);
+  let authReady = false;
+  let authQueue = [];
+  function whenAuthReady(fn) {
+    if (authReady) fn(); else authQueue.push(fn);
+  }
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      authReady = true;
+      authQueue.forEach(fn => fn());
+      authQueue = [];
+    }
+  });
+  signInAnonymously(auth).catch(err => console.error('Firebase sign-in failed:', err));
+
+  window._fbSave = (data) => whenAuthReady(() => set(ref(db, 'banks'), data));
+  window._fbListen = (cb) => whenAuthReady(() => onValue(ref(db, 'banks'), (snap) => cb(snap.val())));
 </script>
 
 <style>
@@ -229,6 +245,7 @@ body { font-family: 'IBM Plex Sans Thai', sans-serif; background: #F4F6F9; color
     <div class="topbar-right">
       <span id="top-date"></span>
       <button id="btn-sync" class="btn-logout" onclick="pullFromSheet(false)">🔄 ซิงค์ Sheet</button>
+      <button class="btn-logout" onclick="dedupeAll()" title="ลบรายการที่เลข LG ซ้ำกัน">🧹 ล้างรายการซ้ำ</button>
       <button class="btn-logout" onclick="doLogout()">ออกจากระบบ</button>
     </div>
   </div>
@@ -350,6 +367,9 @@ function checkAuth() {
 
 // ── DATA ──────────────────────────────────────────────────────────────
 let banks = [];
+let visibleCounts = {};
+const PAGE_SIZE = 5;
+const LOAD_MORE_CHUNK = 30;
 let nid = 10;
 const BANK_COLORS = { BBL:'#1A3C8F', KBANK:'#138808', SCB:'#4C0099' };
 function bankColor(icon) { return BANK_COLORS[icon] || '#374151'; }
@@ -462,12 +482,13 @@ function pullFromSheet(silent) {
         const status = STATUS_MAP[r.status] || 'active';
         const startDate = beToCe(r.startDate);
         const expiry = beToCe(r.expiry);
-        let item = bank.items.find(i => i.lg === r.lg);
+        const lgClean = String(r.lg || '').trim();
+        let item = bank.items.find(i => String(i.lg || '').trim() === lgClean);
         if (item) {
           item.name = r.name; item.amount = Number(r.amount) || 0;
           item.startDate = startDate; item.expiry = expiry; item.status = status;
         } else {
-          bank.items.push({ id: uid(), lg: r.lg, name: r.name, amount: Number(r.amount) || 0, startDate, expiry, status });
+          bank.items.push({ id: uid(), lg: lgClean, name: r.name, amount: Number(r.amount) || 0, startDate, expiry, status, createdAt: Date.now() });
         }
       });
       saveData(); renderAll(); showPage(activePage);
@@ -519,12 +540,14 @@ const TM_FULL = ['มกราคม','กุมภาพันธ์','มี�
 function plainDate(ds) {
   if (!ds) return '-';
   const d = new Date(ds+'T00:00:00');
+  if (isNaN(d.getTime())) return '-';
   return `${d.getDate()} ${TM[d.getMonth()]} ${d.getFullYear()+543}`;
 }
 function expiryInfo(ds) {
   if (!ds) return { label:'-', cls:'' };
   const today = new Date(); today.setHours(0,0,0,0);
   const d = new Date(ds+'T00:00:00');
+  if (isNaN(d.getTime())) return { label:'-', cls:'' };
   const diff = Math.round((d-today)/86400000);
   const label = `${d.getDate()} ${TM[d.getMonth()]} ${d.getFullYear()+543}`;
   if (diff < 0) return { label: label+' ⚠️', cls:'expired' };
@@ -715,24 +738,39 @@ function renderBankPages() {
           <tbody>
             ${!(b.items||[]).length
               ? '<tr class="empty-row"><td colspan="7">ยังไม่มีรายการ — กด "+ เพิ่มรายการ" เพื่อเริ่มต้น</td></tr>'
-              : (b.items||[]).map(item => {
-                  const exp = expiryInfo(item.expiry);
-                  return `<tr class="${item.status==='returned'?'returned':''}">
-                    <td class="td-date">${plainDate(item.startDate)}</td>
-                    <td class="td-lg">${item.lg||'-'}</td>
-                    <td>${item.name}</td>
-                    <td class="td-amount">${fmt(item.amount)}</td>
-                    <td class="td-date ${exp.cls}">${exp.label}</td>
-                    <td onclick="cycleStatus('${b.id}','${item.id}')">${statusLabel(item.status)}</td>
-                    <td style="white-space:nowrap;">
-                      <button class="btn-action" onclick="openEdit('${b.id}','${item.id}')" title="แก้ไข">✏️</button>
-                      <button class="btn-action del" onclick="deleteItem('${b.id}','${item.id}')" title="ลบ">×</button>
-                    </td>
-                  </tr>`;
-                }).join('')
+              : (() => {
+                  const sorted = [...(b.items||[])].sort((a,c) => (c.createdAt||0) - (a.createdAt||0));
+                  const count = visibleCounts[b.id] || PAGE_SIZE;
+                  const visible = sorted.slice(0, count);
+                  return visible.map(item => {
+                    const exp = expiryInfo(item.expiry);
+                    return `<tr class="${item.status==='returned'?'returned':''}">
+                      <td class="td-date">${plainDate(item.startDate)}</td>
+                      <td class="td-lg">${item.lg||'-'}</td>
+                      <td>${item.name}</td>
+                      <td class="td-amount">${fmt(item.amount)}</td>
+                      <td class="td-date ${exp.cls}">${exp.label}</td>
+                      <td onclick="cycleStatus('${b.id}','${item.id}')">${statusLabel(item.status)}</td>
+                      <td style="white-space:nowrap;">
+                        <button class="btn-action" onclick="openEdit('${b.id}','${item.id}')" title="แก้ไข">✏️</button>
+                        <button class="btn-action del" onclick="deleteItem('${b.id}','${item.id}')" title="ลบ">×</button>
+                      </td>
+                    </tr>`;
+                  }).join('');
+                })()
             }
           </tbody>
         </table>
+        ${(() => {
+          const total = (b.items||[]).length;
+          const count = visibleCounts[b.id] || PAGE_SIZE;
+          if (total <= PAGE_SIZE) return '';
+          const remaining = total - count;
+          return `<div class="table-toggle" style="text-align:center;padding:10px;border-top:1px solid #F3F4F6;display:flex;gap:8px;justify-content:center;">
+            ${remaining > 0 ? `<button class="btn-cancel-item" onclick="loadMore('${b.id}')">โหลดเพิ่ม (เหลืออีก ${remaining} รายการ)</button>` : ''}
+            ${count > PAGE_SIZE ? `<button class="btn-cancel-item" onclick="collapseList('${b.id}')">แสดงน้อยลง (ล่าสุด ${PAGE_SIZE} รายการ)</button>` : ''}
+          </div>`;
+        })()}
         <div class="table-footer">
           <span>รวมที่ใช้ไปทั้งหมด (ไม่รวม "คืนแล้ว")</span>
           <strong>${fmt(used)} บาท</strong>
@@ -790,7 +828,7 @@ function addItem(bid) {
     if (!b) { alert('ไม่พบบัญชีธนาคาร กรุณารีเฟรชหน้าเว็บแล้วลองใหม่'); return; }
     if (!b.items) b.items = [];
 
-    const newItem = { id:uid(), lg, name, amount, startDate, expiry, status };
+    const newItem = { id:uid(), lg, name, amount, startDate, expiry, status, createdAt: Date.now() };
     b.items.push(newItem);
     pushItemToSheet(b, newItem);
 
@@ -814,6 +852,46 @@ function addItem(bid) {
     alert('เกิดข้อผิดพลาด: ' + e.message);
     console.error('addItem error:', e);
   }
+}
+
+function loadMore(bid) {
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = 'กำลังโหลด...'; }
+  setTimeout(() => {
+    const total = (banks.find(b=>b.id===bid)?.items||[]).length;
+    visibleCounts[bid] = Math.min((visibleCounts[bid] || PAGE_SIZE) + LOAD_MORE_CHUNK, total);
+    renderBankPages();
+  }, 10);
+}
+function collapseList(bid) {
+  visibleCounts[bid] = PAGE_SIZE;
+  renderBankPages();
+}
+
+function dedupeAll() {
+  if (!confirm('ล้างรายการที่ซ้ำกัน (เลข LG เดียวกันในธนาคารเดียวกัน) จะเก็บไว้แค่รายการเดียวต่อเลข LG ต้องการดำเนินการต่อหรือไม่?')) return;
+  let removed = 0;
+  banks.forEach(b => {
+    if (!b.items) return;
+    const seen = new Map();
+    const kept = [];
+    b.items.forEach(item => {
+      const key = String(item.lg||'').trim() || ('_noid_'+item.id);
+      if (seen.has(key)) {
+        removed++;
+        // เก็บอันที่ข้อมูลครบกว่า (มี amount/วันที่) ไว้แทนถ้าดีกว่า
+        const existing = seen.get(key);
+        if ((!existing.amount && item.amount) || (!existing.startDate && item.startDate)) {
+          seen.set(key, item);
+        }
+      } else {
+        seen.set(key, item);
+      }
+    });
+    b.items = Array.from(seen.values());
+  });
+  saveData(); renderAll(); showPage(activePage);
+  alert(`ล้างรายการซ้ำเสร็จสิ้น: ลบไป ${removed} รายการ`);
 }
 
 function deleteItem(bid, iid) {
